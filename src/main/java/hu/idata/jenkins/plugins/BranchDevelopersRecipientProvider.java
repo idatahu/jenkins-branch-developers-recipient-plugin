@@ -92,29 +92,20 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 			debug.send("Cannot determine the user who triggered the build!");
 		}
 
-		final String branch = getBranch(environmentVariables, context);
 		final File repositoryPath = getRepositoryPath(context, debug);
-		if (repositoryPath != null && branch != null) {
+		if (repositoryPath != null) {
 			try (final Git repository = Git.open(repositoryPath)) {
-				final Set<User> authors = getAuthorsOfCommitsExclusiveToBranch(run, repository, branch, context);
-				usersToBeNotified.addAll(authors);
+				final String branch = getBranch(repository, context, environmentVariables, debug);
+				if (branch != null) {
+					final Set<User> authors = getAuthorsOfCommitsExclusiveToBranch(run, repository, branch, context);
+					usersToBeNotified.addAll(authors);
+				}
 			} catch (final IOException exception) {
 				log(context, "Cannot access the Git repository: %s", exception);
 			}
 		}
 
 		RecipientProviderUtilities.addUsers(usersToBeNotified, context, environmentVariables, to, cc, bcc, debug);
-	}
-
-	@Nullable
-	private static String getBranch(final @Nonnull EnvVars environmentVariables,
-	                                final @Nonnull ExtendedEmailPublisherContext context) {
-		final String branch = environmentVariables.get("GIT_BRANCH");
-		if (branch == null) {
-			log(context, "Cannot determine the checked out Git branch!");
-		}
-
-		return branch;
 	}
 
 	@Nullable
@@ -194,6 +185,40 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		}
 
 		return null;
+	}
+
+	@Nullable
+	private static String getBranch(final @Nonnull Git repository,
+	                                final @Nonnull ExtendedEmailPublisherContext context,
+	                                final @Nonnull EnvVars environmentVariables,
+	                                final @Nonnull RecipientProviderUtilities.IDebug debug) {
+		final String branchFromEnvironment = environmentVariables.get("GIT_BRANCH");
+		if (branchFromEnvironment != null) {
+			debug.send("Branch from environment: %s", branchFromEnvironment);
+			return branchFromEnvironment;
+		}
+
+		final List<String> branchesFromRepository = getBranchesWhichContainCommit(repository, Constants.HEAD, context)
+				.stream().filter(BranchDevelopersRecipientProvider::isLocalBranch)
+				.map(BranchDevelopersRecipientProvider::toRemoteBranch).collect(Collectors.toList());
+		if (branchesFromRepository.size() > 0) {
+			if (branchesFromRepository.size() > 1) {
+				debug.send("Found multiple branches for HEAD: %s", branchesFromRepository);
+			}
+			debug.send("Branch from repository: %s", branchesFromRepository.get(0));
+			return branchesFromRepository.get(0);
+		}
+
+		log(context, "Cannot determine the checked out Git branch!");
+		return null;
+	}
+
+	private static boolean isLocalBranch(final @Nonnull String branch) {
+		return branch.startsWith(Constants.R_HEADS);
+	}
+
+	private static String toRemoteBranch(final @Nonnull String branch) {
+		return branch.replace(Constants.R_HEADS, Constants.DEFAULT_REMOTE_NAME + "/");
 	}
 
 	@Nonnull
