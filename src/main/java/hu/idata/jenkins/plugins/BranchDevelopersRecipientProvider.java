@@ -3,6 +3,7 @@ package hu.idata.jenkins.plugins;
 import hudson.EnvVars;
 import hudson.Extension;
 import hudson.FilePath;
+import hudson.model.AbstractBuild;
 import hudson.model.Run;
 import hudson.model.User;
 import hudson.plugins.emailext.ExtendedEmailPublisherContext;
@@ -14,6 +15,7 @@ import hudson.scm.ChangeLogSet;
 import jakarta.mail.internet.InternetAddress;
 import jenkins.model.Jenkins;
 import jenkins.scm.RunWithSCM;
+import org.apache.commons.lang.StringUtils;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ListBranchCommand;
 import org.eclipse.jgit.api.errors.GitAPIException;
@@ -21,20 +23,39 @@ import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.Ref;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.file.Path;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
 public class BranchDevelopersRecipientProvider extends RecipientProvider {
+	private @Nullable String userSpecifiedWorkspacePath;
+	private @Nullable String userSpecifiedRepositoryPath;
+
 	@DataBoundConstructor
 	public BranchDevelopersRecipientProvider() {
+	}
+
+	@DataBoundSetter
+	public void setWorkspace(final @Nullable String workspace) {
+		if (StringUtils.isNotBlank(workspace)) {
+			userSpecifiedWorkspacePath = workspace;
+		}
+	}
+
+	@DataBoundSetter
+	public void setRepository(final @Nullable String repository) {
+		if (StringUtils.isNotBlank(repository)) {
+			userSpecifiedRepositoryPath = repository;
+		}
 	}
 
 	@Override
@@ -72,7 +93,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		}
 
 		final String branch = getBranch(environmentVariables, context);
-		final File repositoryPath = getRepositoryPath(context);
+		final File repositoryPath = getRepositoryPath(context, debug);
 		if (repositoryPath != null && branch != null) {
 			try (final Git repository = Git.open(repositoryPath)) {
 				final Set<User> authors = getAuthorsOfCommitsExclusiveToBranch(run, repository, branch, context);
@@ -97,20 +118,82 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 	}
 
 	@Nullable
-	private static File getRepositoryPath(final @Nonnull ExtendedEmailPublisherContext context) {
-		final FilePath workspace = context.getWorkspace();
+	private File getRepositoryPath(final @Nonnull ExtendedEmailPublisherContext context,
+	                               final @Nonnull RecipientProviderUtilities.IDebug debug) {
+		final String workspacePath;
+		if (userSpecifiedWorkspacePath != null) {
+			workspacePath = userSpecifiedWorkspacePath;
+			debug.send("User-specified workspace path: %s", workspacePath);
+		} else {
+			workspacePath = getWorkspacePath(context, debug);
+			debug.send("Workspace path: %s", workspacePath);
+		}
+
+		final String repositoryPath;
+		if (userSpecifiedRepositoryPath != null) {
+			if (Path.of(userSpecifiedRepositoryPath).isAbsolute()) {
+				repositoryPath = userSpecifiedRepositoryPath;
+				debug.send("User-specified absolute repository path: %s", repositoryPath);
+			} else if (workspacePath != null) {
+				repositoryPath = Path.of(workspacePath, userSpecifiedRepositoryPath).toString();
+				debug.send("User-specified relative repository path: %s", userSpecifiedRepositoryPath);
+			} else {
+				repositoryPath = null;
+				log(context, "The user-specified repository path is relative, but could not determine the workspace path");
+			}
+		} else if (workspacePath != null) {
+			repositoryPath = workspacePath;
+			debug.send("Repository path is the same as the workspace path");
+		} else {
+			repositoryPath = null;
+			log(context, "The workspace and/or repository should be set in the command");
+		}
+
+		if (repositoryPath == null) {
+			log(context, "Cannot determine repository path");
+			return null;
+		}
+
+		return new File(repositoryPath);
+	}
+
+	@Nullable
+	private static String getWorkspacePath(final @Nonnull ExtendedEmailPublisherContext context,
+	                                       final @Nonnull RecipientProviderUtilities.IDebug debug) {
+		final FilePath workspace = getWorkspace(context);
+		if (workspace == null) {
+			debug.send("Cannot get the path of the workspace");
+			return null;
+		}
+
 		if (workspace.isRemote()) {
 			log(context, "Cannot handle remote workspaces");
 			return null;
 		}
 
-		final String repositoryPathName = workspace.getRemote();
-		if (repositoryPathName == null) {
+		final String workspacePath = workspace.getRemote();
+		if (workspacePath == null) {
 			log(context, "Cannot get the path of the workspace");
 			return null;
 		}
 
-		return new File(repositoryPathName);
+		return workspacePath;
+	}
+
+	@Nullable
+	private static FilePath getWorkspace(final @Nonnull ExtendedEmailPublisherContext context) {
+		final FilePath workspaceFromContext = context.getWorkspace();
+		if (workspaceFromContext != null) {
+			return workspaceFromContext;
+		}
+
+		final Run<?, ?> run  = context.getRun();
+		if (run instanceof AbstractBuild) {
+			final AbstractBuild<?, ?> abstractBuild = (AbstractBuild<?, ?>) run;
+			return abstractBuild.getWorkspace();
+		}
+
+		return null;
 	}
 
 	@Nonnull
