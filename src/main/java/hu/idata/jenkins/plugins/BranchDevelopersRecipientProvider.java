@@ -11,8 +11,10 @@ import hudson.plugins.emailext.ExtendedEmailPublisherDescriptor;
 import hudson.plugins.emailext.plugins.RecipientProvider;
 import hudson.plugins.emailext.plugins.RecipientProviderDescriptor;
 import hudson.plugins.emailext.plugins.recipients.RecipientProviderUtilities;
+import hudson.remoting.VirtualChannel;
 import hudson.scm.ChangeLogSet;
 import jakarta.mail.internet.InternetAddress;
+import jenkins.MasterToSlaveFileCallable;
 import jenkins.model.Jenkins;
 import jenkins.scm.RunWithSCM;
 import org.apache.commons.lang.StringUtils;
@@ -30,9 +32,10 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -92,16 +95,28 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 			debug.send("Cannot determine the user who triggered the build!");
 		}
 
-		final File repositoryPath = getRepositoryPath(context, debug);
+		final FilePath repositoryPath = getRepositoryPath(context, debug);
 		if (repositoryPath != null) {
-			try (final Git repository = Git.open(repositoryPath)) {
-				final String branch = getBranch(repository, context, environmentVariables, debug);
-				if (branch != null) {
-					final Set<User> authors = getAuthorsOfCommitsExclusiveToBranch(run, repository, branch, context);
-					usersToBeNotified.addAll(authors);
-				}
+			try {
+				final List<ChangeLogSet.Entry> changeLogEntries = getChangeLogEntries(context);
+				final List<String> commitIds = changeLogEntries.stream().map(ChangeLogSet.Entry::getCommitId)
+						.collect(Collectors.toList());
+				final String branchFromEnvironment = getBranchFromEnvironment(environmentVariables, debug);
+
+				final BranchDevelopersRecipientCallable remoteOperation =
+						new BranchDevelopersRecipientCallable(commitIds, branchFromEnvironment);
+				final List<String> commitIdsExclusiveToBranch = repositoryPath.act(remoteOperation);
+
+				final List<User> authorsExclusiveToBranch = commitIdsExclusiveToBranch.stream()
+						.map(commitId -> getChangeLogEntry(changeLogEntries, commitId, context))
+						.filter(Objects::nonNull)
+						.map(ChangeLogSet.Entry::getAuthor)
+						.collect(Collectors.toList());
+				usersToBeNotified.addAll(authorsExclusiveToBranch);
 			} catch (final IOException exception) {
-				log(context, "Cannot access the Git repository: %s", exception);
+				log(context, "Cannot execute Git commands on the remote host: %s", exception);
+			} catch (final InterruptedException exception) {
+				log(context, "Interrupted execution of Git commands on the remote host: %s", exception);
 			}
 		}
 
@@ -109,66 +124,33 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 	}
 
 	@Nullable
-	private File getRepositoryPath(final @Nonnull ExtendedEmailPublisherContext context,
-	                               final @Nonnull RecipientProviderUtilities.IDebug debug) {
-		final String workspacePath;
+	private FilePath getRepositoryPath(final @Nonnull ExtendedEmailPublisherContext context,
+	                                   final @Nonnull RecipientProviderUtilities.IDebug debug) {
+		final FilePath workspace;
 		if (userSpecifiedWorkspacePath != null) {
-			workspacePath = userSpecifiedWorkspacePath;
-			debug.send("User-specified workspace path: %s", workspacePath);
+			final File workspaceFile = new File(userSpecifiedWorkspacePath);
+			workspace = new FilePath(workspaceFile);
+			debug.send("User-specified workspace path: %s", workspace);
 		} else {
-			workspacePath = getWorkspacePath(context, debug);
-			debug.send("Workspace path: %s", workspacePath);
-		}
-
-		final String repositoryPath;
-		if (userSpecifiedRepositoryPath != null) {
-			if (Path.of(userSpecifiedRepositoryPath).isAbsolute()) {
-				repositoryPath = userSpecifiedRepositoryPath;
-				debug.send("User-specified absolute repository path: %s", repositoryPath);
-			} else if (workspacePath != null) {
-				repositoryPath = Path.of(workspacePath, userSpecifiedRepositoryPath).toString();
-				debug.send("User-specified relative repository path: %s", userSpecifiedRepositoryPath);
-			} else {
-				repositoryPath = null;
-				log(context, "The user-specified repository path is relative, but could not determine the workspace path");
+			workspace = getWorkspace(context);
+			if (workspace == null) {
+				debug.send("Cannot get the path of the workspace");
+				return null;
 			}
-		} else if (workspacePath != null) {
-			repositoryPath = workspacePath;
-			debug.send("Repository path is the same as the workspace path");
+
+			debug.send("Workspace: %s", workspace);
+		}
+
+		final FilePath repository;
+		if (userSpecifiedRepositoryPath != null) {
+			repository = new FilePath(workspace, userSpecifiedRepositoryPath);
+			debug.send("User-specified repository path: %s", repository);
 		} else {
-			repositoryPath = null;
-			log(context, "The workspace and/or repository should be set in the command");
+			repository = workspace;
+			debug.send("Repository path is the same as the workspace path");
 		}
 
-		if (repositoryPath == null) {
-			log(context, "Cannot determine repository path");
-			return null;
-		}
-
-		return new File(repositoryPath);
-	}
-
-	@Nullable
-	private static String getWorkspacePath(final @Nonnull ExtendedEmailPublisherContext context,
-	                                       final @Nonnull RecipientProviderUtilities.IDebug debug) {
-		final FilePath workspace = getWorkspace(context);
-		if (workspace == null) {
-			debug.send("Cannot get the path of the workspace");
-			return null;
-		}
-
-		if (workspace.isRemote()) {
-			log(context, "Cannot handle remote workspaces");
-			return null;
-		}
-
-		final String workspacePath = workspace.getRemote();
-		if (workspacePath == null) {
-			log(context, "Cannot get the path of the workspace");
-			return null;
-		}
-
-		return workspacePath;
+		return repository;
 	}
 
 	@Nullable
@@ -187,102 +169,47 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		return null;
 	}
 
-	@Nullable
-	private static String getBranch(final @Nonnull Git repository,
-	                                final @Nonnull ExtendedEmailPublisherContext context,
-	                                final @Nonnull EnvVars environmentVariables,
-	                                final @Nonnull RecipientProviderUtilities.IDebug debug) {
-		final String branchFromEnvironment = environmentVariables.get("GIT_BRANCH");
-		if (branchFromEnvironment != null) {
-			debug.send("Branch from environment: %s", branchFromEnvironment);
-			return branchFromEnvironment;
-		}
-
-		final List<String> branchesFromRepository = getBranchesWhichContainCommit(repository, Constants.HEAD, context)
-				.stream().filter(BranchDevelopersRecipientProvider::isLocalBranch)
-				.map(BranchDevelopersRecipientProvider::toRemoteBranch).collect(Collectors.toList());
-		if (branchesFromRepository.size() > 0) {
-			if (branchesFromRepository.size() > 1) {
-				debug.send("Found multiple branches for HEAD: %s", branchesFromRepository);
-			}
-			debug.send("Branch from repository: %s", branchesFromRepository.get(0));
-			return branchesFromRepository.get(0);
-		}
-
-		log(context, "Cannot determine the checked out Git branch!");
-		return null;
-	}
-
-	private static boolean isLocalBranch(final @Nonnull String branch) {
-		return branch.startsWith(Constants.R_HEADS);
-	}
-
-	private static String toRemoteBranch(final @Nonnull String branch) {
-		return branch.replace(Constants.R_HEADS, Constants.DEFAULT_REMOTE_NAME + "/");
-	}
-
 	@Nonnull
-	private static Set<User> getAuthorsOfCommitsExclusiveToBranch(final @Nonnull Run<?, ?> run,
-	                                                              final @Nonnull Git repository,
-	                                                              final @Nonnull String branch,
-	                                                              final @Nonnull ExtendedEmailPublisherContext context) {
-		final Set<User> authors = new HashSet<>();
-
-		getChangeLogSets(run, context).forEach(changeLogSet ->
-				addAuthorsOfCommitsExclusiveToBranch(changeLogSet, repository, branch, authors, context));
-
-		return authors;
-	}
-
-	@Nonnull
-	private static List<ChangeLogSet<? extends ChangeLogSet.Entry>> getChangeLogSets(final @Nonnull Run<?, ?> run,
-	                                                                                 final @Nonnull ExtendedEmailPublisherContext context) {
+	private static List<ChangeLogSet.Entry> getChangeLogEntries(final @Nonnull ExtendedEmailPublisherContext context) {
+		final Run<?, ?> run = context.getRun();
 		if (run instanceof RunWithSCM) {
 			final RunWithSCM<?, ?> runWithSCM = (RunWithSCM<?, ?>) run;
-			return runWithSCM.getChangeSets();
+			return runWithSCM.getChangeSets().stream()
+					.map(BranchDevelopersRecipientProvider::getChangeLogEntries)
+					.flatMap(List::stream).collect(Collectors.toList());
 		}
 
 		log(context, "No SCM associated with this run!");
 		return List.of();
 	}
 
-	private static void addAuthorsOfCommitsExclusiveToBranch(final @Nonnull ChangeLogSet<? extends ChangeLogSet.Entry> changeLogSet,
-	                                                         final @Nonnull Git repository, final @Nonnull String branch,
-	                                                         final @Nonnull Set<User> authors,
-	                                                         final @Nonnull ExtendedEmailPublisherContext context) {
-		changeLogSet.forEach(changeLog -> {
-			final User author = changeLog.getAuthor();
-			if (!authors.contains(author)) {
-				final String commitId = changeLog.getCommitId();
-				final List<String> branches = getBranchesWhichContainCommit(repository, commitId, context);
-
-				/* If the commit is present only on the current branch, then the author of the commit should be notified. */
-				if (branches.size() == 1 && branch.equals(branches.get(0))) {
-					authors.add(author);
-				}
-			}
-		});
-	}
-
 	@Nonnull
-	private static List<String> getBranchesWhichContainCommit(final @Nonnull Git repository,
-	                                                          final @Nonnull String commitId,
-	                                                          final @Nonnull ExtendedEmailPublisherContext context) {
-		try {
-			final List<Ref> branchReferences = repository.branchList().setListMode(ListBranchCommand.ListMode.ALL)
-					.setContains(commitId).call();
-			return branchReferences.stream()
-					.map(BranchDevelopersRecipientProvider::getBranchName)
-					.filter(branch -> !Constants.HEAD.equals(branch))
-					.collect(Collectors.toList());
-		} catch (final GitAPIException exception) {
-			log(context, "Cannot get the name of branches which contain commit %s: %s", commitId, exception);
-			return List.of();
-		}
+	private static List<ChangeLogSet.Entry> getChangeLogEntries(final @Nonnull ChangeLogSet<? extends ChangeLogSet.Entry> changeLogSet) {
+		final List<ChangeLogSet.Entry> changeLogEntries = new ArrayList<>();
+		changeLogSet.forEach(changeLogEntries::add);
+		return changeLogEntries;
 	}
 
-	private static String getBranchName(final @Nonnull Ref ref) {
-		return ref.getName().replace("refs/remotes/", "");
+	private static String getBranchFromEnvironment(EnvVars environmentVariables, RecipientProviderUtilities.IDebug debug) {
+		final String branchFromEnvironment = environmentVariables.get("GIT_BRANCH");
+		if (branchFromEnvironment != null) {
+			debug.send("Branch from environment: %s", branchFromEnvironment);
+			return branchFromEnvironment;
+		}
+		return null;
+	}
+
+	@Nullable
+	private ChangeLogSet.Entry getChangeLogEntry(final @Nonnull List<ChangeLogSet.Entry> changeLogEntries,
+	                                             final @Nonnull String commitId,
+	                                             final @Nonnull ExtendedEmailPublisherContext context) {
+		final List<ChangeLogSet.Entry> changeLogEntriesForCommitId = changeLogEntries.stream()
+				.filter(changeLogEntry -> commitId.equals(changeLogEntry.getCommitId())).collect(Collectors.toList());
+		if (changeLogEntriesForCommitId.isEmpty()) {
+			log(context, "Cannot find changelog entry for commit %s", commitId);
+			return null;
+		}
+		return null;
 	}
 
 	private static void log(final @Nonnull ExtendedEmailPublisherContext context, final @Nonnull String message,
@@ -299,6 +226,100 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		@Override
 		public String getDisplayName() {
 			return "Developers who worked on the branch";
+		}
+	}
+
+	private static class BranchDevelopersRecipientCallable extends MasterToSlaveFileCallable<List<String>> {
+		private static final long serialVersionUID = 1L;
+		private final @Nonnull List<String> commitIds;
+		private final @Nullable String branchFromEnvironment;
+		private final @Nonnull List<String> logMessages;
+
+		private BranchDevelopersRecipientCallable(final @Nonnull List<String> commitIds,
+		                                          final @Nullable String branchFromEnvironment) {
+			this.commitIds = commitIds;
+			this.branchFromEnvironment = branchFromEnvironment;
+			this.logMessages = new ArrayList<>();
+		}
+
+		@Override
+		@Nonnull
+		public List<String> invoke(final @Nonnull File repositoryPath, final @Nullable VirtualChannel channel)
+				throws IOException, InterruptedException {
+			log("Invoked in %s", repositoryPath);
+			try (final Git repository = Git.open(repositoryPath)) {
+				final String branch = getBranch(repository);
+				if (branch != null) {
+					return getCommitsExclusiveToBranch(repository, branch, commitIds);
+				}
+			} catch (final IOException exception) {
+				log("Cannot access the Git repository: %s", exception);
+			}
+
+			return List.of();
+		}
+
+		@Nullable
+		private String getBranch(final @Nonnull Git repository) {
+			if (branchFromEnvironment != null) {
+				return branchFromEnvironment;
+			}
+
+			final List<String> branchesFromRepository = getBranchesWhichContainCommit(repository, Constants.HEAD)
+					.stream().filter(BranchDevelopersRecipientCallable::isLocalBranch)
+					.map(BranchDevelopersRecipientCallable::toRemoteBranch).collect(Collectors.toList());
+			if (branchesFromRepository.size() > 0) {
+				if (branchesFromRepository.size() > 1) {
+					log("Found multiple branches for HEAD: %s", branchesFromRepository);
+				}
+				log("Branch from repository: %s", branchesFromRepository.get(0));
+				return branchesFromRepository.get(0);
+			}
+
+			log("Cannot determine the checked out Git branch!");
+			return null;
+		}
+
+		@Nonnull
+		private List<String> getBranchesWhichContainCommit(final @Nonnull Git repository,
+		                                                   final @Nonnull String commitId) {
+			try {
+				final List<Ref> branchReferences = repository.branchList().setListMode(ListBranchCommand.ListMode.ALL)
+						.setContains(commitId).call();
+				return branchReferences.stream()
+						.map(BranchDevelopersRecipientCallable::getBranchName)
+						.filter(branch -> !Constants.HEAD.equals(branch))
+						.collect(Collectors.toList());
+			} catch (final GitAPIException exception) {
+				log("Cannot get the name of branches which contain commit %s: %s", commitId, exception);
+				return List.of();
+			}
+		}
+
+		@Nonnull
+		private List<String> getCommitsExclusiveToBranch(final @Nonnull Git repository, final @Nonnull String branch,
+		                                                 final @Nonnull List<String> commitIds) {
+			return commitIds.stream().filter(commitId -> {
+				final List<String> branches = getBranchesWhichContainCommit(repository, commitId);
+				/* If the commit is present only on the current branch, then the author of the commit should be notified. */
+				return branches.size() == 1 && branch.equals(branches.get(0));
+			}).collect(Collectors.toList());
+		}
+
+		private static boolean isLocalBranch(final @Nonnull String branch) {
+			return branch.startsWith(Constants.R_HEADS);
+		}
+
+		private static String toRemoteBranch(final @Nonnull String branch) {
+			return branch.replace(Constants.R_HEADS, Constants.DEFAULT_REMOTE_NAME + "/");
+		}
+
+		private static String getBranchName(final @Nonnull Ref ref) {
+			return ref.getName().replace("refs/remotes/", "");
+		}
+
+		private void log(final String format, final Object... arguments) {
+			logMessages.add(String.format(format, arguments));
 		}
 	}
 }
