@@ -297,7 +297,13 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 			return commitIds.stream().filter(commitId -> {
 				final List<String> branches = getBranchesWhichContainCommit(repository, commitId, logger);
 				/* If the commit is present only on the current branch, then the author of the commit should be notified. */
-				return branches.size() == 1 && branch.equals(branches.get(0));
+				boolean exclusiveToBranch = branches.size() == 1 && branch.equals(branches.get(0));
+				if (exclusiveToBranch) {
+					log(logger, "Commit %s can be only found on current branch (%s)", commitId, branch);
+				} else {
+					log(logger, "Commit %s can be found on multiple branches (%s)", commitId, branches);
+				}
+				return exclusiveToBranch;
 			}).collect(Collectors.toList());
 		}
 
