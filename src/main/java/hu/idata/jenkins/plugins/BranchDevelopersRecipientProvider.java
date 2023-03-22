@@ -11,6 +11,7 @@ import hudson.plugins.emailext.ExtendedEmailPublisherDescriptor;
 import hudson.plugins.emailext.plugins.RecipientProvider;
 import hudson.plugins.emailext.plugins.RecipientProviderDescriptor;
 import hudson.plugins.emailext.plugins.recipients.RecipientProviderUtilities;
+import hudson.remoting.RemoteOutputStream;
 import hudson.remoting.VirtualChannel;
 import hudson.scm.ChangeLogSet;
 import jakarta.mail.internet.InternetAddress;
@@ -32,6 +33,7 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -102,9 +104,10 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 				final Map<String, ChangeLogSet.Entry> changeLogEntries = getChangeLogEntries(context);
 				final Set<String> commitIds = changeLogEntries.keySet();
 				final String branchFromEnvironment = getBranchFromEnvironment(environmentVariables, debug);
+				final RemoteOutputStream remoteLogger = new RemoteOutputStream(context.getListener().getLogger());
 
 				final BranchDevelopersRecipientCallable remoteOperation =
-						new BranchDevelopersRecipientCallable(commitIds, branchFromEnvironment);
+						new BranchDevelopersRecipientCallable(commitIds, branchFromEnvironment, remoteLogger);
 				final List<String> commitIdsExclusiveToBranch = repositoryPath.act(remoteOperation);
 
 				final List<User> authorsExclusiveToBranch = commitIdsExclusiveToBranch.stream()
@@ -219,13 +222,14 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		private static final long serialVersionUID = 1L;
 		private final @Nonnull Set<String> commitIds;
 		private final @Nullable String branchFromEnvironment;
-		private final @Nonnull List<String> logMessages;
+		private final @Nonnull RemoteOutputStream logger;
 
 		private BranchDevelopersRecipientCallable(final @Nonnull Set<String> commitIds,
-		                                          final @Nullable String branchFromEnvironment) {
+		                                          final @Nullable String branchFromEnvironment,
+		                                          final @Nonnull RemoteOutputStream logger) {
 			this.commitIds = commitIds;
 			this.branchFromEnvironment = branchFromEnvironment;
-			this.logMessages = new ArrayList<>();
+			this.logger = logger;
 		}
 
 		@Override
@@ -305,7 +309,12 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		}
 
 		private void log(final String format, final Object... arguments) {
-			logMessages.add(String.format(format, arguments));
+			try {
+				final String message = String.format(format + "%n", arguments);
+				logger.write(message.getBytes(StandardCharsets.UTF_8));
+			} catch (IOException e) {
+				/* Ignore the exception */
+			}
 		}
 	}
 }
