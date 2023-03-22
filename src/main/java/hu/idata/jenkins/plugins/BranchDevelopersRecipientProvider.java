@@ -5,6 +5,7 @@ import hudson.Extension;
 import hudson.FilePath;
 import hudson.model.AbstractBuild;
 import hudson.model.Run;
+import hudson.model.TaskListener;
 import hudson.model.User;
 import hudson.plugins.emailext.ExtendedEmailPublisherContext;
 import hudson.plugins.emailext.ExtendedEmailPublisherDescriptor;
@@ -102,12 +103,11 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		if (repositoryPath != null) {
 			try {
 				final Map<String, ChangeLogSet.Entry> changeLogEntries = getChangeLogEntries(context);
-				final Set<String> commitIds = changeLogEntries.keySet();
+				final List<String> commitIds = new ArrayList<>(changeLogEntries.keySet());
 				final String branchFromEnvironment = getBranchFromEnvironment(environmentVariables, debug);
-				final RemoteOutputStream remoteLogger = new RemoteOutputStream(context.getListener().getLogger());
 
 				final BranchDevelopersRecipientCallable remoteOperation =
-						new BranchDevelopersRecipientCallable(commitIds, branchFromEnvironment, remoteLogger);
+						new BranchDevelopersRecipientCallable(commitIds, branchFromEnvironment, context.getListener());
 				final List<String> commitIdsExclusiveToBranch = repositoryPath.act(remoteOperation);
 
 				final List<User> authorsExclusiveToBranch = commitIdsExclusiveToBranch.stream()
@@ -220,59 +220,63 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 
 	private static class BranchDevelopersRecipientCallable extends MasterToSlaveFileCallable<List<String>> {
 		private static final long serialVersionUID = 1L;
-		private final @Nonnull Set<String> commitIds;
+		private final @Nonnull List<String> commitIds;
 		private final @Nullable String branchFromEnvironment;
-		private final @Nonnull RemoteOutputStream logger;
+		private final @Nonnull TaskListener listener;
 
-		private BranchDevelopersRecipientCallable(final @Nonnull Set<String> commitIds,
+		private BranchDevelopersRecipientCallable(final @Nonnull List<String> commitIds,
 		                                          final @Nullable String branchFromEnvironment,
-		                                          final @Nonnull RemoteOutputStream logger) {
+		                                          final @Nonnull TaskListener listener) {
 			this.commitIds = commitIds;
 			this.branchFromEnvironment = branchFromEnvironment;
-			this.logger = logger;
+			this.listener = listener;
 		}
 
 		@Override
 		@Nonnull
 		public List<String> invoke(final @Nonnull File repositoryPath, final @Nullable VirtualChannel channel)
 				throws IOException, InterruptedException {
-			log("Invoked in %s", repositoryPath);
+			final RemoteOutputStream logger = new RemoteOutputStream(listener.getLogger());
+			log(logger, "Invoked in %s", repositoryPath);
+
 			try (final Git repository = Git.open(repositoryPath)) {
-				final String branch = getBranch(repository);
+				final String branch = getBranch(repository, logger);
 				if (branch != null) {
-					return getCommitsExclusiveToBranch(repository, branch, commitIds);
+					return getCommitsExclusiveToBranch(repository, branch, commitIds, logger);
 				}
 			} catch (final IOException exception) {
-				log("Cannot access the Git repository: %s", exception);
+				log(logger, "Cannot access the Git repository: %s", exception);
 			}
 
 			return List.of();
 		}
 
 		@Nullable
-		private String getBranch(final @Nonnull Git repository) {
+		private String getBranch(final @Nonnull Git repository, final @Nonnull RemoteOutputStream logger) {
 			if (branchFromEnvironment != null) {
 				return branchFromEnvironment;
 			}
 
-			final List<String> branchesFromRepository = getBranchesWhichContainCommit(repository, Constants.HEAD)
-					.stream().filter(BranchDevelopersRecipientCallable::isLocalBranch)
-					.map(BranchDevelopersRecipientCallable::toRemoteBranch).collect(Collectors.toList());
+			final List<String> branchesFromRepository =
+					getBranchesWhichContainCommit(repository, Constants.HEAD, logger)
+							.stream().filter(BranchDevelopersRecipientCallable::isLocalBranch)
+							.map(BranchDevelopersRecipientCallable::toRemoteBranch).collect(Collectors.toList());
 			if (branchesFromRepository.size() > 0) {
 				if (branchesFromRepository.size() > 1) {
-					log("Found multiple branches for HEAD: %s", branchesFromRepository);
+					log(logger, "Found multiple branches for HEAD: %s", branchesFromRepository);
 				}
-				log("Branch from repository: %s", branchesFromRepository.get(0));
+				log(logger, "Branch from repository: %s", branchesFromRepository.get(0));
 				return branchesFromRepository.get(0);
 			}
 
-			log("Cannot determine the checked out Git branch!");
+			log(logger, "Cannot determine the checked out Git branch!");
 			return null;
 		}
 
 		@Nonnull
 		private List<String> getBranchesWhichContainCommit(final @Nonnull Git repository,
-		                                                   final @Nonnull String commitId) {
+		                                                   final @Nonnull String commitId,
+		                                                   final @Nonnull RemoteOutputStream logger) {
 			try {
 				final List<Ref> branchReferences = repository.branchList().setListMode(ListBranchCommand.ListMode.ALL)
 						.setContains(commitId).call();
@@ -281,16 +285,17 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 						.filter(branch -> !Constants.HEAD.equals(branch))
 						.collect(Collectors.toList());
 			} catch (final GitAPIException exception) {
-				log("Cannot get the name of branches which contain commit %s: %s", commitId, exception);
+				log(logger, "Cannot get the name of branches which contain commit %s: %s", commitId, exception);
 				return List.of();
 			}
 		}
 
 		@Nonnull
 		private List<String> getCommitsExclusiveToBranch(final @Nonnull Git repository, final @Nonnull String branch,
-		                                                 final @Nonnull Set<String> commitIds) {
+		                                                 final @Nonnull List<String> commitIds,
+		                                                 final @Nonnull RemoteOutputStream logger) {
 			return commitIds.stream().filter(commitId -> {
-				final List<String> branches = getBranchesWhichContainCommit(repository, commitId);
+				final List<String> branches = getBranchesWhichContainCommit(repository, commitId, logger);
 				/* If the commit is present only on the current branch, then the author of the commit should be notified. */
 				return branches.size() == 1 && branch.equals(branches.get(0));
 			}).collect(Collectors.toList());
@@ -308,7 +313,8 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 			return ref.getName().replace("refs/remotes/", "");
 		}
 
-		private void log(final String format, final Object... arguments) {
+		private void log(final @Nonnull RemoteOutputStream logger, final @Nonnull String format,
+		                 final Object... arguments) {
 			try {
 				final String message = String.format(format + "%n", arguments);
 				logger.write(message.getBytes(StandardCharsets.UTF_8));
