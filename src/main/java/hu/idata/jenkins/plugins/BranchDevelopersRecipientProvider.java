@@ -35,8 +35,9 @@ import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Objects;
+import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class BranchDevelopersRecipientProvider extends RecipientProvider {
@@ -98,9 +99,8 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		final FilePath repositoryPath = getRepositoryPath(context, debug);
 		if (repositoryPath != null) {
 			try {
-				final List<ChangeLogSet.Entry> changeLogEntries = getChangeLogEntries(context);
-				final List<String> commitIds = changeLogEntries.stream().map(ChangeLogSet.Entry::getCommitId)
-						.collect(Collectors.toList());
+				final Map<String, ChangeLogSet.Entry> changeLogEntries = getChangeLogEntries(context);
+				final Set<String> commitIds = changeLogEntries.keySet();
 				final String branchFromEnvironment = getBranchFromEnvironment(environmentVariables, debug);
 
 				final BranchDevelopersRecipientCallable remoteOperation =
@@ -108,8 +108,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 				final List<String> commitIdsExclusiveToBranch = repositoryPath.act(remoteOperation);
 
 				final List<User> authorsExclusiveToBranch = commitIdsExclusiveToBranch.stream()
-						.map(commitId -> getChangeLogEntry(changeLogEntries, commitId, context))
-						.filter(Objects::nonNull)
+						.map(changeLogEntries::get)
 						.map(ChangeLogSet.Entry::getAuthor)
 						.collect(Collectors.toList());
 				usersToBeNotified.addAll(authorsExclusiveToBranch);
@@ -170,17 +169,17 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 	}
 
 	@Nonnull
-	private static List<ChangeLogSet.Entry> getChangeLogEntries(final @Nonnull ExtendedEmailPublisherContext context) {
+	private static Map<String, ChangeLogSet.Entry> getChangeLogEntries(final @Nonnull ExtendedEmailPublisherContext context) {
 		final Run<?, ?> run = context.getRun();
 		if (run instanceof RunWithSCM) {
 			final RunWithSCM<?, ?> runWithSCM = (RunWithSCM<?, ?>) run;
 			return runWithSCM.getChangeSets().stream()
-					.map(BranchDevelopersRecipientProvider::getChangeLogEntries)
-					.flatMap(List::stream).collect(Collectors.toList());
+					.map(BranchDevelopersRecipientProvider::getChangeLogEntries).flatMap(List::stream)
+					.collect(Collectors.toMap(ChangeLogSet.Entry::getCommitId, Function.identity()));
 		}
 
 		log(context, "No SCM associated with this run!");
-		return List.of();
+		return Map.of();
 	}
 
 	@Nonnull
@@ -195,19 +194,6 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		if (branchFromEnvironment != null) {
 			debug.send("Branch from environment: %s", branchFromEnvironment);
 			return branchFromEnvironment;
-		}
-		return null;
-	}
-
-	@Nullable
-	private ChangeLogSet.Entry getChangeLogEntry(final @Nonnull List<ChangeLogSet.Entry> changeLogEntries,
-	                                             final @Nonnull String commitId,
-	                                             final @Nonnull ExtendedEmailPublisherContext context) {
-		final List<ChangeLogSet.Entry> changeLogEntriesForCommitId = changeLogEntries.stream()
-				.filter(changeLogEntry -> commitId.equals(changeLogEntry.getCommitId())).collect(Collectors.toList());
-		if (changeLogEntriesForCommitId.isEmpty()) {
-			log(context, "Cannot find changelog entry for commit %s", commitId);
-			return null;
 		}
 		return null;
 	}
@@ -231,11 +217,11 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 
 	private static class BranchDevelopersRecipientCallable extends MasterToSlaveFileCallable<List<String>> {
 		private static final long serialVersionUID = 1L;
-		private final @Nonnull List<String> commitIds;
+		private final @Nonnull Set<String> commitIds;
 		private final @Nullable String branchFromEnvironment;
 		private final @Nonnull List<String> logMessages;
 
-		private BranchDevelopersRecipientCallable(final @Nonnull List<String> commitIds,
+		private BranchDevelopersRecipientCallable(final @Nonnull Set<String> commitIds,
 		                                          final @Nullable String branchFromEnvironment) {
 			this.commitIds = commitIds;
 			this.branchFromEnvironment = branchFromEnvironment;
@@ -298,7 +284,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 
 		@Nonnull
 		private List<String> getCommitsExclusiveToBranch(final @Nonnull Git repository, final @Nonnull String branch,
-		                                                 final @Nonnull List<String> commitIds) {
+		                                                 final @Nonnull Set<String> commitIds) {
 			return commitIds.stream().filter(commitId -> {
 				final List<String> branches = getBranchesWhichContainCommit(repository, commitId);
 				/* If the commit is present only on the current branch, then the author of the commit should be notified. */
