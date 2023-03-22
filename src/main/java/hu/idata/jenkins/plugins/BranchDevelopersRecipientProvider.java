@@ -258,9 +258,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 			}
 
 			final List<String> branchesFromRepository =
-					getBranchesWhichContainCommit(repository, Constants.HEAD, logger)
-							.stream().filter(BranchDevelopersRecipientCallable::isLocalBranch)
-							.map(BranchDevelopersRecipientCallable::toRemoteBranch).collect(Collectors.toList());
+					getRemoteBranchesWhichContainCommit(repository, Constants.HEAD, logger);
 			if (branchesFromRepository.size() > 0) {
 				if (branchesFromRepository.size() > 1) {
 					log(logger, "Found multiple branches for HEAD: %s", branchesFromRepository);
@@ -274,12 +272,12 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		}
 
 		@Nonnull
-		private List<String> getBranchesWhichContainCommit(final @Nonnull Git repository,
-		                                                   final @Nonnull String commitId,
-		                                                   final @Nonnull RemoteOutputStream logger) {
+		private List<String> getRemoteBranchesWhichContainCommit(final @Nonnull Git repository,
+		                                                         final @Nonnull String commitId,
+		                                                         final @Nonnull RemoteOutputStream logger) {
 			try {
-				final List<Ref> branchReferences = repository.branchList().setListMode(ListBranchCommand.ListMode.ALL)
-						.setContains(commitId).call();
+				final List<Ref> branchReferences = repository.branchList()
+						.setListMode(ListBranchCommand.ListMode.REMOTE).setContains(commitId).call();
 				return branchReferences.stream()
 						.map(BranchDevelopersRecipientCallable::getBranchName)
 						.filter(branch -> !Constants.HEAD.equals(branch))
@@ -295,7 +293,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		                                                 final @Nonnull List<String> commitIds,
 		                                                 final @Nonnull RemoteOutputStream logger) {
 			return commitIds.stream().filter(commitId -> {
-				final List<String> branches = getBranchesWhichContainCommit(repository, commitId, logger);
+				final List<String> branches = getRemoteBranchesWhichContainCommit(repository, commitId, logger);
 				/* If the commit is present only on the current branch, then the author of the commit should be notified. */
 				boolean exclusiveToBranch = branches.size() == 1 && branch.equals(branches.get(0));
 				if (exclusiveToBranch) {
@@ -305,14 +303,6 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 				}
 				return exclusiveToBranch;
 			}).collect(Collectors.toList());
-		}
-
-		private static boolean isLocalBranch(final @Nonnull String branch) {
-			return branch.startsWith(Constants.R_HEADS);
-		}
-
-		private static String toRemoteBranch(final @Nonnull String branch) {
-			return branch.replace(Constants.R_HEADS, Constants.DEFAULT_REMOTE_NAME + "/");
 		}
 
 		private static String getBranchName(final @Nonnull Ref ref) {
