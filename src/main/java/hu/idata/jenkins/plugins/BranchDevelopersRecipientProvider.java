@@ -23,6 +23,7 @@ import org.apache.commons.lang.StringUtils;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ListBranchCommand;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.api.errors.JGitInternalException;
 import org.eclipse.jgit.lib.Constants;
 import org.eclipse.jgit.lib.Ref;
 import org.jenkinsci.Symbol;
@@ -177,6 +178,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 		if (run instanceof RunWithSCM) {
 			final RunWithSCM<?, ?> runWithSCM = (RunWithSCM<?, ?>) run;
 			return runWithSCM.getChangeSets().stream()
+					.filter(changeLogSet -> "git".equals(changeLogSet.getKind()))
 					.map(BranchDevelopersRecipientProvider::getChangeLogEntries).flatMap(List::stream)
 					.collect(Collectors.toMap(ChangeLogSet.Entry::getCommitId, Function.identity()));
 		}
@@ -282,7 +284,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 						.map(BranchDevelopersRecipientCallable::getBranchName)
 						.filter(branch -> !Constants.HEAD.equals(branch))
 						.collect(Collectors.toList());
-			} catch (final GitAPIException exception) {
+			} catch (final GitAPIException | JGitInternalException exception) {
 				log(logger, "Cannot get the name of branches which contain commit %s: %s", commitId, exception);
 				return List.of();
 			}
@@ -298,7 +300,7 @@ public class BranchDevelopersRecipientProvider extends RecipientProvider {
 				boolean exclusiveToBranch = branches.size() == 1 && branch.equals(branches.get(0));
 				if (exclusiveToBranch) {
 					log(logger, "Commit %s can be only found on current branch (%s)", commitId, branch);
-				} else {
+				} else if (branches.size() > 1) {
 					log(logger, "Commit %s can be found on multiple branches (%s)", commitId, branches);
 				}
 				return exclusiveToBranch;
